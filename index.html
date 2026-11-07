@@ -454,6 +454,16 @@ table.pr-table tr.pr-total td{border-top:1.2px solid #A9812B;border-bottom:none;
   .pr-sheet{max-height:none;overflow:visible;padding:0;}
   @page{ size:letter; margin:12mm; }
 }
+.q-fresh{padding:9px 12px;border-radius:8px;font-size:13px;margin-bottom:12px;border:1px solid var(--rule);}
+.q-fresh.ok{background:var(--good-bg);color:var(--good);}.q-fresh.mid{background:var(--paper-2);}.q-fresh.warn{background:var(--bad-bg);color:var(--bad);}
+.q-drop{display:block;border:2px dashed var(--rule-strong);border-radius:12px;padding:22px 14px;text-align:center;cursor:pointer;color:var(--text-soft);font-size:13.5px;transition:.15s;}
+.q-drop b{display:block;color:var(--ink);font-size:15px;margin-bottom:4px;}
+.q-drop.over,.q-drop:hover{background:var(--paper-2);border-color:var(--ink);}
+.q-drop input{display:none;}
+.q-b{display:inline-block;padding:3px 8px;border-radius:999px;font-size:11.5px;font-weight:600;}
+.q-b.ok{background:var(--good-bg);color:var(--good);}.q-b.bad{background:var(--bad-bg);color:var(--bad);}.q-b.mid{background:var(--paper-2);color:var(--text-soft);}
+#qActions{display:none;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px;}
+.q-sep{margin:22px 0 8px;font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--text-soft);}
 </style>
 </head>
 <body>
@@ -699,6 +709,12 @@ table.pr-table tr.pr-total td{border-top:1.2px solid #A9812B;border-bottom:none;
     </div>
 
     <div class="tab-panel active" id="tabXlsx">
+      <div id="qFresh" class="q-fresh"></div>
+      <label class="q-drop" id="qDrop"><b>Carga rápida: toca aquí o arrastra tus archivos</b>Puedes elegir uno o varios Excel de SICOIN GL a la vez. Se leen aquí en tu navegador, se comparan con el total oficial y los que coinciden se guardan con un solo botón.<input type="file" id="qFiles" accept=".xls,.xlsx" multiple></label>
+      <div class="status-msg" id="qStatus"></div>
+      <div id="qQueue" style="margin-top:12px"></div>
+      <div id="qActions"><button class="btn" id="qSaveOk">Guardar</button><button class="btn secondary" id="qClear">Limpiar lista</button><span id="qNote" style="font-size:12.5px;color:var(--text-soft)"></span></div>
+      <div class="q-sep">Revisar un archivo en detalle</div>
       <p class="help-text">
         Subí directamente el archivo <b>.xls</b> que descargás desde SICOIN GL (formato "Excel" en el reporte
         "Ejecución de Egresos del Ejercicio", con "Todos los Programas"). Se procesa en tu propio navegador —
@@ -3343,10 +3359,125 @@ table.pr-table tr.pr-total td{border-top:1.2px solid #A9812B;border-bottom:none;
     });
   }
 
+  /* ================= v5: carga rápida (varios Excel, arrastrar y soltar) ================= */
+  var Q = {items:[], busy:false};
+  function todayIso(){ var d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
+  function qFresh(){
+    var el=document.getElementById('qFresh'); if(!el) return;
+    var snaps=state.snapshots||[];
+    if(!snaps.length){ el.className='q-fresh warn'; el.innerHTML='Todavía no hay cortes guardados.'; return; }
+    var last=snaps[snaps.length-1].periodEnd, d=daysBetween(last,todayIso());
+    var cls=d<=1?'ok':(d<=3?'mid':'warn');
+    el.className='q-fresh '+cls;
+    el.innerHTML='Último corte guardado: <b>'+fmtDate(last)+'</b> · '+(d<=0?'es de hoy':(d===1?'hace 1 día':'hace '+d+' días'))+(d>1?' · conviene cargar uno nuevo':'');
+  }
+  function qParseFile(file){
+    return new Promise(function(res){
+      var r=new FileReader();
+      r.onload=function(ev){
+        try{
+          var wb=XLSX.read(new Uint8Array(ev.target.result),{type:'array'});
+          var ws=wb.Sheets[wb.SheetNames[0]];
+          var rows=XLSX.utils.sheet_to_json(ws,{header:1,raw:true,defval:''});
+          var result=parseExcelSicoin(rows);
+          var pe=result.period&&result.period.periodEnd;
+          if(!pe) return res({name:file.name,mod:file.lastModified||0,err:'No se encontró la fecha del corte en el archivo (¿es el reporte correcto?).'});
+          res({name:file.name,mod:file.lastModified||0,result:result,periodEnd:pe,vok:result.validation.ok,nprog:result.programas.length});
+        }catch(e){ res({name:file.name,mod:file.lastModified||0,err:'No se pudo leer: '+(e&&e.message?e.message:e)}); }
+      };
+      r.onerror=function(){ res({name:file.name,mod:0,err:'No se pudo leer el archivo.'}); };
+      r.readAsArrayBuffer(file);
+    });
+  }
+  function qClassify(){
+    var best={};
+    Q.items.forEach(function(it,i){ it.skip=false; if(it.err) return; var b=best[it.periodEnd]; if(b===undefined||it.mod>=Q.items[b].mod) best[it.periodEnd]=i; });
+    Q.items.forEach(function(it,i){
+      if(it.st==='saved'||it.st==='fail') return;
+      if(it.err){ it.st='err'; return; }
+      if(best[it.periodEnd]!==i){ it.st='dup'; it.skip=true; return; }
+      var ex=(state.snapshots||[]).find(function(s){ return s.periodEnd===it.periodEnd; });
+      it.exists=!!ex;
+      it.st = it.vok===true?'ok':(it.vok===false?'dif':'sinver');
+    });
+  }
+  function qStLabel(it){
+    return {ok:'<span class="q-b ok">Coincide con el total oficial</span>',dif:'<span class="q-b bad">No coincide con el total oficial</span>',sinver:'<span class="q-b mid">Sin total para verificar</span>',dup:'<span class="q-b mid">Repetido (se usa el más reciente)</span>',err:'<span class="q-b bad">Error</span>',saved:'<span class="q-b ok">Guardado ✓</span>',fail:'<span class="q-b bad">No se guardó</span>'}[it.st]||'';
+  }
+  function qRender(){
+    var box=document.getElementById('qQueue'); if(!box) return;
+    qClassify();
+    if(!Q.items.length){ box.innerHTML=''; document.getElementById('qActions').style.display='none'; return; }
+    var items=Q.items.map(function(it,i){return {it:it,i:i};}).sort(function(a,b){ return (a.it.periodEnd||'').localeCompare(b.it.periodEnd||''); });
+    var h='<div class="table-scroll"><table class="pend" style="min-width:560px"><thead><tr><th>Archivo</th><th>Corte</th><th>Estado</th><th></th></tr></thead><tbody>';
+    items.forEach(function(x){
+      var it=x.it;
+      h+='<tr><td style="word-break:break-all">'+esc(it.name)+(it.err?'<div class="note-sm" style="color:var(--bad)">'+esc(it.err)+'</div>':'')+'</td>'
+        +'<td>'+(it.periodEnd?fmtDate(it.periodEnd)+(it.exists&&it.st!=='saved'?'<div class="note-sm">ya existe, se reemplaza</div>':''):'—')+'</td>'
+        +'<td>'+qStLabel(it)+'</td>'
+        +'<td>'+((it.st==='dif'||it.st==='sinver')?'<button class="btn secondary" data-qrev="'+x.i+'" style="padding:5px 10px;font-size:12px">Revisar</button>':'')+'</td></tr>';
+    });
+    h+='</tbody></table></div>';
+    box.innerHTML=h;
+    var nOk=Q.items.filter(function(it){return it.st==='ok';}).length;
+    var nRev=Q.items.filter(function(it){return it.st==='dif'||it.st==='sinver';}).length;
+    var act=document.getElementById('qActions'); act.style.display='flex';
+    var b=document.getElementById('qSaveOk'); b.disabled=Q.busy||!nOk; b.textContent=nOk?('Guardar '+nOk+(nOk===1?' corte válido':' cortes válidos')):'No hay cortes válidos para guardar';
+    document.getElementById('qNote').textContent=nRev?(nRev+(nRev===1?' archivo necesita':' archivos necesitan')+' revisión: usa "Revisar" para verlos y decidir uno por uno.'):'';
+  }
+  async function qAddFiles(fileList){
+    var files=Array.prototype.slice.call(fileList||[]);
+    if(!files.length) return;
+    var st=document.getElementById('qStatus'); st.className='status-msg'; st.textContent='Leyendo '+files.length+(files.length===1?' archivo…':' archivos…');
+    for(var k=0;k<files.length;k++){ Q.items.push(await qParseFile(files[k])); }
+    st.className='status-msg'; st.textContent='';
+    qRender();
+  }
+  async function qSaveAll(){
+    if(Q.busy) return; Q.busy=true; qRender();
+    var st=document.getElementById('qStatus'), todo=Q.items.filter(function(it){return it.st==='ok';}).sort(function(a,b){return a.periodEnd.localeCompare(b.periodEnd);});
+    var done=0, bad=0;
+    for(var i=0;i<todo.length;i++){
+      var it=todo[i], pe=it.periodEnd, ps=(it.result.period&&it.result.period.periodStart)||pe;
+      st.className='status-msg'; st.textContent='Guardando '+(i+1)+' de '+todo.length+' ('+fmtDate(pe)+')…';
+      try{
+        var rows=flattenPrograms(it.result.programas,pe,ps,currentMemberName());
+        if(!rows.length) throw new Error('sin obras');
+        await replaceSnapshotSafely(pe,rows);
+        try{ await upsertMeta(buildMeta(it.result,pe,currentMemberName())); }catch(me){}
+        it.st='saved'; done++;
+      }catch(e){ it.st='fail'; it.err=e.message; bad++; }
+    }
+    try{ state.snapshots=await loadSnapshots(); if(todo.length){ state.selectedPeriod=todo[todo.length-1].periodEnd; } render(); }catch(e){}
+    Q.busy=false; qRender(); qFresh();
+    st.className='status-msg '+(bad?'err':'ok');
+    st.textContent=done+(done===1?' corte guardado':' cortes guardados')+(bad?(' · '+bad+' con error'):'')+'. El tablero ya está actualizado para todo el equipo.';
+  }
+  function bindV5(){
+    var inp=document.getElementById('qFiles'), dz=document.getElementById('qDrop');
+    if(!inp) return;
+    inp.addEventListener('change',function(){ qAddFiles(inp.files); inp.value=''; });
+    ['dragenter','dragover'].forEach(function(ev){ dz.addEventListener(ev,function(e){ e.preventDefault(); dz.classList.add('over'); }); });
+    ['dragleave','drop'].forEach(function(ev){ dz.addEventListener(ev,function(e){ e.preventDefault(); dz.classList.remove('over'); }); });
+    dz.addEventListener('drop',function(e){ qAddFiles(e.dataTransfer&&e.dataTransfer.files); });
+    document.getElementById('qSaveOk').addEventListener('click',qSaveAll);
+    document.getElementById('qClear').addEventListener('click',function(){ Q.items=[]; document.getElementById('qStatus').className='status-msg'; qRender(); });
+    document.getElementById('qQueue').addEventListener('click',function(e){
+      var b=e.target.closest('[data-qrev]'); if(!b) return;
+      var it=Q.items[+b.getAttribute('data-qrev')]; if(!it||!it.result) return;
+      document.getElementById('xlsxStatus').className='status-msg';
+      renderXlsxResult(it.result);
+      var pv=document.getElementById('xlsxPreview'); if(pv&&pv.scrollIntoView) pv.scrollIntoView({behavior:'smooth',block:'start'});
+    });
+    document.querySelectorAll('.tab-btn').forEach(function(b){ b.addEventListener('click',qFresh); });
+    qFresh();
+  }
+
   function safe(fn, label){
     try{ fn(); } catch(e){ console.error('Error renderizando '+label+':', e); }
   }
   function render(){
+    try{ qFresh(); }catch(e){}
     safe(renderPeriodSelect, 'selector de corte');
     safe(renderStatus, 'estado del corte');
     safe(renderHero, 'resumen general');
@@ -3652,6 +3783,7 @@ table.pr-table tr.pr-total td{border-top:1.2px solid #A9812B;border-bottom:none;
   }
 
   bindV4();
+  bindV5();
   bindV3();
   (async function init(){
     var savedName = localStorage.getItem('budget_dashboard_member_name');
